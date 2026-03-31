@@ -2,6 +2,13 @@
 # coder-daemon.sh — Агент-программист (Coder)
 # Берёт задачи из колонки "To Do", реализует код, пушит в Review.
 # Запускается через systemd (bravo-coder.service).
+#
+# ТОКЕН-КОНТРОЛЬ:
+# Claude Pro имеет лимит ~44K токенов за 5-часовое окно.
+# Каждая атомарная задача расходует ~10-15K токенов.
+# В peak-часы (16-22 MSK / 13-19 UTC) расход выше.
+# Демон отслеживает количество выполненных задач за окно
+# и останавливается при достижении лимита.
 
 set -euo pipefail
 
@@ -18,7 +25,155 @@ source "${SCRIPT_DIR}/common.sh"
 
 SLEEP_INTERVAL="${SLEEP_INTERVAL:-300}"   # 5 минут между итерациями
 MAX_RETRIES=3                              # Максимум попыток кодирования на задачу
-CODEX_TIMEOUT=1800                        # 30 минут максимум на codex exec
+CODER_TIMEOUT=1800                        # 30 минут максимум на Claude Code
+
+# ---------------------------------------------------------------------------
+# Токен-контроль
+# ---------------------------------------------------------------------------
+
+# Файл для хранения состояния токен-бюджета
+TOKEN_STATE_FILE="/var/log/bravo/coder-token-state"
+
+# Лимиты задач за 5-часовое окно
+# Каждая атомарная задача ≈ 10-15K токенов, лимит ≈ 44K
+TASKS_LIMIT_OFFPEAK=3   # Off-peak: можно 3 задачи за окно (30-45K из 44K)
+TASKS_LIMIT_PEAK=2      # Peak: можно 2 задачи (быстрее расход, меньше запас)
+TOKEN_WINDOW_HOURS=5     # Длина окна лимита Claude Pro
+
+# Peak часы: 16-22 MSK = 13-19 UTC (самое загруженное время, токены тратятся быстрее)
+PEAK_START_UTC=13
+PEAK_END_UTC=19
+
+# is_peak_hour — проверяет, сейчас ли пиковое время
+is_peak_hour() {
+    local current_hour
+    current_hour=$(date -u +%H | sed 's/^0//')
+    if [[ ${current_hour} -ge ${PEAK_START_UTC} && ${current_hour} -lt ${PEAK_END_UTC} ]]; then
+        return 0  # true — peak
+    fi
+    return 1  # false — off-peak
+}
+
+# get_tasks_limit — возвращает лимит задач для текущего времени
+get_tasks_limit() {
+    if is_peak_hour; then
+        echo "${TASKS_LIMIT_PEAK}"
+    else
+        echo "${TASKS_LIMIT_OFFPEAK}"
+    fi
+}
+
+# init_token_state — инициализирует файл состояния, если не существует
+init_token_state() {
+    if [[ ! -f "${TOKEN_STATE_FILE}" ]]; then
+        echo "0 $(date +%s)" > "${TOKEN_STATE_FILE}"
+        log "Инициализирован файл токен-состояния"
+    fi
+}
+
+# read_token_state — читает текущее состояние: (tasks_done, window_start_epoch)
+read_token_state() {
+    init_token_state
+    cat "${TOKEN_STATE_FILE}"
+}
+
+# write_token_state — записывает состояние
+write_token_state() {
+    local tasks_done="$1"
+    local window_start="$2"
+    echo "${tasks_done} ${window_start}" > "${TOKEN_STATE_FILE}"
+}
+
+# check_token_budget — проверяет, есть ли бюджет для новой задачи
+# Возвращает 0 (true) — можно брать, 1 (false) — нельзя
+check_token_budget() {
+    local state
+    state=$(read_token_state)
+    local tasks_done window_start
+    tasks_done=$(echo "${state}" | awk '{print $1}')
+    window_start=$(echo "${state}" | awk '{print $2}')
+
+    local now
+    now=$(date +%s)
+    local window_seconds=$((TOKEN_WINDOW_HOURS * 3600))
+    local elapsed=$((now - window_start))
+
+    # Если окно истекло — сбросить счётчик
+    if [[ ${elapsed} -ge ${window_seconds} ]]; then
+        log "Токен-окно истекло (${elapsed}s >= ${window_seconds}s). Сброс счётчика."
+        write_token_state 0 "${now}"
+        tasks_done=0
+    fi
+
+    local limit
+    limit=$(get_tasks_limit)
+
+    local remaining=$((limit - tasks_done))
+    local window_remaining_min=$(( (window_seconds - elapsed) / 60 ))
+
+    if [[ ${tasks_done} -ge ${limit} ]]; then
+        log "⛔ ТОКЕН-ЛИМИТ: выполнено ${tasks_done}/${limit} задач за текущее окно."
+        log "   Окно сбросится через ${window_remaining_min} мин."
+        if is_peak_hour; then
+            log "   Сейчас peak-часы (${PEAK_START_UTC}-${PEAK_END_UTC} UTC), лимит снижен."
+        fi
+        return 1  # нельзя брать
+    fi
+
+    log "Токен-бюджет: ${tasks_done}/${limit} задач использовано. Осталось: ${remaining}. Окно: ещё ${window_remaining_min} мин."
+    return 0  # можно брать
+}
+
+# record_task_completed — увеличивает счётчик выполненных задач
+record_task_completed() {
+    local state
+    state=$(read_token_state)
+    local tasks_done window_start
+    tasks_done=$(echo "${state}" | awk '{print $1}')
+    window_start=$(echo "${state}" | awk '{print $2}')
+
+    tasks_done=$((tasks_done + 1))
+    write_token_state "${tasks_done}" "${window_start}"
+    log "Записано: ${tasks_done} задач выполнено в текущем окне."
+}
+
+# record_task_failed — записывает неудачную задачу (тоже расходует токены!)
+record_task_failed() {
+    local exit_code="$1"
+    # Если Claude Code стартовал и работал (exit != 124 timeout), он потратил токены
+    # При exit 1 от rate limit — тем более израсходовал всё окно
+    if [[ ${exit_code} -eq 1 ]]; then
+        # Exit 1 часто означает rate limit — считаем что окно исчерпано
+        log "⚠️ Claude Code exit 1 — возможно rate limit. Помечаем окно как исчерпанное."
+        local now
+        now=$(date +%s)
+        local limit
+        limit=$(get_tasks_limit)
+        write_token_state "${limit}" "$(echo "$(read_token_state)" | awk '{print $2}')"
+    else
+        # Другие ошибки — тоже расход, но частичный
+        record_task_completed
+    fi
+}
+
+# calculate_sleep_until_window_reset — сколько секунд ждать до сброса окна
+calculate_sleep_until_window_reset() {
+    local state
+    state=$(read_token_state)
+    local window_start
+    window_start=$(echo "${state}" | awk '{print $2}')
+    local now
+    now=$(date +%s)
+    local window_seconds=$((TOKEN_WINDOW_HOURS * 3600))
+    local reset_at=$((window_start + window_seconds))
+    local wait_seconds=$((reset_at - now))
+
+    if [[ ${wait_seconds} -lt 0 ]]; then
+        wait_seconds=0
+    fi
+
+    echo "${wait_seconds}"
+}
 
 # ---------------------------------------------------------------------------
 # Основная логика итерации
@@ -58,9 +213,9 @@ process_task() {
 
     log "Ветка ${branch_name} готова"
 
-    # 5. Запустить Codex для реализации
-    local codex_prompt
-    codex_prompt=$(cat <<PROMPT
+    # 5. Запустить Claude Code для реализации
+    local coder_prompt
+    coder_prompt=$(cat <<PROMPT
 Ты — опытный разработчик. Прочитай файл CODE.md в этом репозитории для понимания проекта.
 
 Затем реализуй следующую задачу из GitHub Issue #${issue_number}:
@@ -76,20 +231,22 @@ ${issue_spec}
 PROMPT
 )
 
-    log "Запускаем codex exec для issue #${issue_number}..."
+    log "Запускаем Claude Code для issue #${issue_number}..."
 
-    local codex_exit=0
-    timeout "${CODEX_TIMEOUT}" codex exec --full-auto "${codex_prompt}" || codex_exit=$?
+    local coder_exit=0
+    timeout "${CODER_TIMEOUT}" claude -p "${coder_prompt}" --output-format text --allowedTools Edit,Bash,Write || coder_exit=$?
 
-    if [[ ${codex_exit} -eq 124 ]]; then
-        log "ERROR: codex exec превысил таймаут (${CODEX_TIMEOUT}s) для issue #${issue_number}"
+    if [[ ${coder_exit} -eq 124 ]]; then
+        log "ERROR: Claude Code превысил таймаут (${CODER_TIMEOUT}s) для issue #${issue_number}"
         comment_on_issue "${issue_number}" "❌ **Coder**: превышен таймаут выполнения (30 мин). Задача остаётся в In Progress."
         unassign_issue "${issue_number}"
+        record_task_failed "${coder_exit}"
         return 1
-    elif [[ ${codex_exit} -ne 0 ]]; then
-        log "ERROR: codex exec завершился с кодом ${codex_exit} для issue #${issue_number}"
-        comment_on_issue "${issue_number}" "❌ **Coder**: ошибка выполнения codex (exit ${codex_exit}). Задача остаётся в In Progress."
+    elif [[ ${coder_exit} -ne 0 ]]; then
+        log "ERROR: Claude Code завершился с кодом ${coder_exit} для issue #${issue_number}"
+        comment_on_issue "${issue_number}" "❌ **Coder**: ошибка выполнения (exit ${coder_exit}). Задача остаётся в In Progress."
         unassign_issue "${issue_number}"
+        record_task_failed "${coder_exit}"
         return 1
     fi
 
@@ -99,8 +256,9 @@ PROMPT
 
     if [[ -z "${git_status}" ]]; then
         log "GATE FAILED: нет изменённых файлов для issue #${issue_number}"
-        comment_on_issue "${issue_number}" "⚠️ **Coder**: gate не пройден — codex не создал/изменил ни одного файла. Задача остаётся в In Progress для повторной попытки."
+        comment_on_issue "${issue_number}" "⚠️ **Coder**: gate не пройден — не создано/изменено ни одного файла. Задача остаётся в In Progress."
         unassign_issue "${issue_number}"
+        record_task_completed  # токены потрачены, даже если результата нет
         return 1
     fi
 
@@ -139,6 +297,9 @@ ${changed_files}
 
 Задача перемещена в **Review** для проверки."
 
+    # 10. Записать успешное выполнение задачи
+    record_task_completed
+
     log "=== Issue #${issue_number} успешно обработан и передан в Review ==="
 }
 
@@ -148,13 +309,30 @@ ${changed_files}
 
 main() {
     check_dependencies
+    init_token_state
     log "============================================"
     log "Coder Daemon запущен. Репозиторий: ${PIPELINE_REPO}"
     log "Интервал опроса: ${SLEEP_INTERVAL}s"
+    log "Токен-лимит: ${TASKS_LIMIT_OFFPEAK} задач (off-peak) / ${TASKS_LIMIT_PEAK} (peak)"
+    log "Peak часы: ${PEAK_START_UTC}-${PEAK_END_UTC} UTC"
     log "============================================"
 
     while true; do
         log "--- Новая итерация ---"
+
+        # ТОКЕН-КОНТРОЛЬ: проверить бюджет перед поиском задачи
+        if ! check_token_budget; then
+            local wait_secs
+            wait_secs=$(calculate_sleep_until_window_reset)
+
+            if [[ ${wait_secs} -gt 0 ]]; then
+                local wait_mins=$((wait_secs / 60))
+                log "💤 Засыпаю на ${wait_mins} мин до сброса токен-окна..."
+                sleep "${wait_secs}"
+                log "Просыпаюсь — токен-окно должно было сброситься."
+                continue
+            fi
+        fi
 
         # Найти первую незанятую задачу в "To Do"
         local task_line=""
