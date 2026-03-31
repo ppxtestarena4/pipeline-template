@@ -179,7 +179,7 @@ PROMPT
     local test_output=""
     local codex_exit=0
 
-    test_output=$(timeout "${CODEX_TIMEOUT}" codex exec --full-auto "${codex_prompt}" 2>&1) || codex_exit=$?
+    test_output=$(timeout "${CODEX_TIMEOUT}" codex exec --full-auto --skip-git-repo-check "${codex_prompt}" 2>&1) || codex_exit=$?
 
     if [[ ${codex_exit} -eq 124 ]]; then
         log "ERROR: codex exec превысил таймаут для тестирования issue #${issue_number}"
@@ -264,7 +264,7 @@ main() {
 
         # Найти первую незанятую задачу в "Testing"
         local task_line=""
-        task_line=$(get_first_unassigned_item_by_status "Testing" 2>/dev/null || true)
+        task_line=$(get_project_items_by_status "Testing" | head -1 2>/dev/null || true)
 
         if [[ -z "${task_line}" ]]; then
             log "Нет задач в 'Testing'. Ожидание ${SLEEP_INTERVAL}s..."

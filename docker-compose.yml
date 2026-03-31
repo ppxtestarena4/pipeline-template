@@ -1,0 +1,72 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: techtcb
+      POSTGRES_USER: techtcb
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-techtcb_secret}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - techtcb_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U techtcb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./src/backend
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql://techtcb:${POSTGRES_PASSWORD:-techtcb_secret}@postgres:5432/techtcb
+      JWT_SECRET: ${JWT_SECRET:-change_me_in_production_jwt_secret}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      UPLOADS_DIR: /app/uploads
+      NODE_ENV: production
+      PORT: 3001
+    volumes:
+      - uploads_data:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - techtcb_network
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./src/frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: /api
+        VITE_WS_URL: /ws
+    networks:
+      - techtcb_network
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "${PORT:-80}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - uploads_data:/app/uploads:ro
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - techtcb_network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  uploads_data:
+
+networks:
+  techtcb_network:
+    driver: bridge

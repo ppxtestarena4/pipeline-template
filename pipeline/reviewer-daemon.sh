@@ -116,7 +116,7 @@ PROMPT
     local review_output=""
     local codex_exit=0
 
-    review_output=$(timeout "${CODEX_TIMEOUT}" codex exec --full-auto "${codex_prompt}" 2>&1) || codex_exit=$?
+    review_output=$(timeout "${CODEX_TIMEOUT}" codex exec --full-auto --skip-git-repo-check "${codex_prompt}" 2>&1) || codex_exit=$?
 
     if [[ ${codex_exit} -eq 124 ]]; then
         log "ERROR: codex exec превысил таймаут для ревью issue #${issue_number}"

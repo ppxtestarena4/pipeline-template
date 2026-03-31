@@ -18,7 +18,7 @@ source "${SCRIPT_DIR}/common.sh"
 
 SLEEP_INTERVAL="${SLEEP_INTERVAL:-300}"   # 5 минут между итерациями
 MAX_RETRIES=3                              # Максимум попыток кодирования на задачу
-CODEX_TIMEOUT=1800                        # 30 минут максимум на codex exec
+CODER_TIMEOUT=1800                        # 30 минут максимум на Claude Code
 
 # ---------------------------------------------------------------------------
 # Основная логика итерации
@@ -59,8 +59,8 @@ process_task() {
     log "Ветка ${branch_name} готова"
 
     # 5. Запустить Codex для реализации
-    local codex_prompt
-    codex_prompt=$(cat <<PROMPT
+    local coder_prompt
+    coder_prompt=$(cat <<PROMPT
 Ты — опытный разработчик. Прочитай файл CODE.md в этом репозитории для понимания проекта.
 
 Затем реализуй следующую задачу из GitHub Issue #${issue_number}:
@@ -76,19 +76,19 @@ ${issue_spec}
 PROMPT
 )
 
-    log "Запускаем codex exec для issue #${issue_number}..."
+    log "Запускаем Claude Code для issue #${issue_number}..."
 
-    local codex_exit=0
-    timeout "${CODEX_TIMEOUT}" codex exec --full-auto "${codex_prompt}" || codex_exit=$?
+    local coder_exit=0
+    timeout "${CODER_TIMEOUT}" claude -p "${coder_prompt}" --output-format text --allowedTools Edit,Bash,Write || coder_exit=$?
 
-    if [[ ${codex_exit} -eq 124 ]]; then
-        log "ERROR: codex exec превысил таймаут (${CODEX_TIMEOUT}s) для issue #${issue_number}"
+    if [[ ${coder_exit} -eq 124 ]]; then
+        log "ERROR: Claude Code превысил таймаут (${CODER_TIMEOUT}s) для issue #${issue_number}"
         comment_on_issue "${issue_number}" "❌ **Coder**: превышен таймаут выполнения (30 мин). Задача остаётся в In Progress."
         unassign_issue "${issue_number}"
         return 1
-    elif [[ ${codex_exit} -ne 0 ]]; then
-        log "ERROR: codex exec завершился с кодом ${codex_exit} для issue #${issue_number}"
-        comment_on_issue "${issue_number}" "❌ **Coder**: ошибка выполнения codex (exit ${codex_exit}). Задача остаётся в In Progress."
+    elif [[ ${coder_exit} -ne 0 ]]; then
+        log "ERROR: Claude Code завершился с кодом ${coder_exit} для issue #${issue_number}"
+        comment_on_issue "${issue_number}" "❌ **Coder**: ошибка выполнения codex (exit ${coder_exit}). Задача остаётся в In Progress."
         unassign_issue "${issue_number}"
         return 1
     fi
