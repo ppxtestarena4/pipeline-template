@@ -230,4 +230,128 @@ sudo bash pipeline/install.sh
 
 ---
 
-*Последнее обновление: 2026-03-27*
+---
+
+## Система управления задачами (Issue #2 — BRD v1.4)
+
+Полноценная система управления задачами для гибридных команд (люди + AI-агенты).
+
+### Структура
+
+```
+src/
+├── backend/                    # Node.js + Express + TypeScript
+│   ├── prisma/
+│   │   ├── schema.prisma       # Схема БД (PostgreSQL)
+│   │   ├── seed.ts             # Тестовые данные
+│   │   └── migrations/         # SQL-миграции
+│   ├── src/
+│   │   ├── index.ts            # Точка входа, WebSocket
+│   │   ├── db.ts               # Prisma client
+│   │   ├── middleware/
+│   │   │   ├── auth.ts         # JWT + API-токен авторизация
+│   │   │   └── error.ts        # Обработка ошибок
+│   │   ├── routes/
+│   │   │   ├── auth.ts         # POST /login, /register, /create-agent, GET /me
+│   │   │   ├── users.ts        # CRUD пользователей, direct reports
+│   │   │   ├── projects.ts     # CRUD проектов, статистика
+│   │   │   ├── tasks.ts        # CRUD задач, kanban, subtasks, comments
+│   │   │   ├── reports.ts      # Отчёты (3-уровневая иерархия), модерация
+│   │   │   ├── intake.ts       # Intake pipeline: текст/файл → AI → задачи
+│   │   │   ├── notifications.ts # Уведомления
+│   │   │   └── goals.ts        # Еженедельные цели
+│   │   └── services/
+│   │       ├── ai.ts           # Claude API: извлечение задач, маршрутизация
+│   │       └── notifications.ts # WebSocket push, createNotification()
+│   ├── Dockerfile
+│   └── package.json
+│
+├── frontend/                   # React 18 + TypeScript + Vite + Tailwind
+│   ├── src/
+│   │   ├── api/                # Axios-клиент + все API-запросы
+│   │   ├── components/
+│   │   │   ├── Layout.tsx      # Sidebar + header + notifications
+│   │   │   ├── TaskCard.tsx    # Карточка задачи с метаданными
+│   │   │   ├── TaskModal.tsx   # Модальное окно создания задачи
+│   │   │   ├── DirectReportTabs.tsx # Переключатель direct reports
+│   │   │   └── NotificationPanel.tsx
+│   │   ├── hooks/
+│   │   │   └── useAuth.ts      # Auth context + login/logout
+│   │   ├── pages/
+│   │   │   ├── LoginPage.tsx
+│   │   │   ├── DashboardPage.tsx  # Обзор + статистика по сотруднику
+│   │   │   ├── KanbanPage.tsx     # Drag & drop канбан (dnd-kit)
+│   │   │   ├── TaskDetailPage.tsx # Детали, subtasks, комментарии, audit log
+│   │   │   ├── ReportsPage.tsx    # Генерация отчётов, 3 уровня
+│   │   │   ├── IntakePage.tsx     # Drag & drop файлов, модерация задач
+│   │   │   ├── GoalsPage.tsx      # Еженедельные цели
+│   │   │   └── ProjectsPage.tsx   # Управление проектами
+│   │   └── types/index.ts      # TypeScript-типы
+│   ├── Dockerfile
+│   └── package.json
+│
+nginx/
+│   └── nginx.conf              # Reverse proxy: API + WS + SPA
+│
+docker-compose.yml              # postgres + backend + frontend + nginx
+.env.example                    # Шаблон переменных окружения
+```
+
+### Запуск для разработки
+
+```bash
+# 1. Запустить PostgreSQL
+docker run -e POSTGRES_DB=techtcb -e POSTGRES_USER=techtcb \
+  -e POSTGRES_PASSWORD=techtcb_secret -p 5432:5432 postgres:16-alpine
+
+# 2. Backend
+cd src/backend
+cp .env.example .env       # отредактируй при необходимости
+npm install
+npm run db:migrate:dev
+npm run db:seed
+npm run dev
+
+# 3. Frontend
+cd src/frontend
+npm install
+npm run dev
+```
+
+### Деплой через Docker Compose
+
+```bash
+cp .env.example .env       # Заполни все переменные
+docker compose up -d
+docker compose exec backend npm run db:seed   # опционально
+```
+
+### API для AI-агентов (FR-41–FR-45)
+
+```bash
+# Получить задачи в колонке TODO
+curl -H "Authorization: Bearer <api_token>" \
+  http://localhost/api/tasks?status=TODO&assigneeId=<agent_id>
+
+# Взять задачу (переместить в IN_PROGRESS)
+curl -X POST -H "Authorization: Bearer <api_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"status":"IN_PROGRESS"}' \
+  http://localhost/api/tasks/<task_id>/move
+
+# Добавить комментарий
+curl -X POST -H "Authorization: Bearer <api_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"content":"Выполнено. VERDICT: PASS"}' \
+  http://localhost/api/tasks/<task_id>/comments
+```
+
+### Основные учётные данные (seed)
+
+| Роль | Email | Пароль |
+|------|-------|--------|
+| Администратор | admin@techtcb.local | admin123 |
+| Руководитель | manager@techtcb.local | manager123 |
+| Сотрудник | melnikov@techtcb.local | employee123 |
+
+*Последнее обновление: 2026-03-31*

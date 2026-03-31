@@ -1,0 +1,328 @@
+// Prisma schema for TechTCB Task Management System
+// BRD v1.4 — Issue #2
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserType {
+  HUMAN
+  AI_AGENT
+}
+
+enum UserRole {
+  ADMIN
+  MANAGER
+  EMPLOYEE
+  AI_AGENT
+}
+
+enum TaskStatus {
+  BACKLOG
+  TODO
+  IN_PROGRESS
+  REVIEW
+  TESTING
+  DONE
+}
+
+enum TaskPriority {
+  CRITICAL
+  HIGH
+  MEDIUM
+  LOW
+}
+
+enum TaskCategory {
+  RUN
+  CHANGE
+}
+
+enum GoalStatus {
+  COMPLETED
+  PARTIAL
+  NOT_DONE
+}
+
+enum ReportStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  COMMENTED
+}
+
+enum NotificationType {
+  TASK_ASSIGNED
+  TASK_MENTIONED
+  TASK_DEADLINE
+  TASK_STATUS_CHANGED
+  REPORT_SUBMITTED
+  REPORT_APPROVED
+  REPORT_COMMENTED
+  INTAKE_TASKS_READY
+  GOAL_SET
+}
+
+enum IntakeStatus {
+  PENDING
+  PROCESSING
+  READY_FOR_MODERATION
+  MODERATED
+  FAILED
+}
+
+// ─── Users ──────────────────────────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String?  @map("password_hash")
+  name         String
+  type         UserType @default(HUMAN)
+  role         UserRole @default(EMPLOYEE)
+  apiToken     String?  @unique @map("api_token")
+  avatarUrl    String?  @map("avatar_url")
+  managerId    String?  @map("manager_id")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  manager      User?    @relation("DirectReports", fields: [managerId], references: [id])
+  directReports User[]  @relation("DirectReports")
+
+  ownedProjects     Project[]       @relation("ProjectOwner")
+  projectMemberships ProjectMember[]
+  assignedTasks     Task[]          @relation("TaskAssignee")
+  createdTasks      Task[]          @relation("TaskCreator")
+  subtasksAssigned  Subtask[]       @relation("SubtaskAssignee")
+  comments          Comment[]
+  notifications     Notification[]
+  reports           Report[]        @relation("ReportUser")
+  approvedReports   Report[]        @relation("ReportApprover")
+  goalsAsEmployee   WeeklyGoal[]    @relation("GoalEmployee")
+  goalsAsManager    WeeklyGoal[]    @relation("GoalManager")
+  intakes           Intake[]
+  auditLogs         AuditLog[]
+
+  @@map("users")
+}
+
+// ─── Projects ───────────────────────────────────────────────────────────────
+
+model Project {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  ownerId     String   @map("owner_id")
+  archived    Boolean  @default(false)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  owner   User            @relation("ProjectOwner", fields: [ownerId], references: [id])
+  members ProjectMember[]
+  tasks   Task[]
+
+  @@map("projects")
+}
+
+model ProjectMember {
+  projectId String @map("project_id")
+  userId    String @map("user_id")
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([projectId, userId])
+  @@map("project_members")
+}
+
+// ─── Tasks ───────────────────────────────────────────────────────────────────
+
+model Task {
+  id           String       @id @default(cuid())
+  title        String
+  description  String?
+  projectId    String       @map("project_id")
+  assigneeId   String?      @map("assignee_id")
+  creatorId    String       @map("creator_id")
+  status       TaskStatus   @default(BACKLOG)
+  priority     TaskPriority @default(MEDIUM)
+  category     TaskCategory @default(RUN)
+  deadline     DateTime?
+  parentTaskId String?      @map("parent_task_id")
+  labels       String[]     @default([])
+  position     Int          @default(0) // for ordering within kanban column
+  completedAt  DateTime?    @map("completed_at")
+  createdAt    DateTime     @default(now()) @map("created_at")
+  updatedAt    DateTime     @updatedAt @map("updated_at")
+
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  assignee   User?    @relation("TaskAssignee", fields: [assigneeId], references: [id])
+  creator    User     @relation("TaskCreator", fields: [creatorId], references: [id])
+  parentTask Task?    @relation("SubTasks", fields: [parentTaskId], references: [id])
+  subTasks   Task[]   @relation("SubTasks")
+  subtasks   Subtask[]
+  comments   Comment[]
+  auditLogs  AuditLog[]
+  goalLinks  GoalTaskLink[]
+  intakeTasks IntakeTask[]
+
+  @@map("tasks")
+}
+
+model Subtask {
+  id         String   @id @default(cuid())
+  taskId     String   @map("task_id")
+  title      String
+  completed  Boolean  @default(false)
+  assigneeId String?  @map("assignee_id")
+  position   Int      @default(0)
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  task     Task  @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  assignee User? @relation("SubtaskAssignee", fields: [assigneeId], references: [id])
+
+  @@map("subtasks")
+}
+
+// ─── Comments ───────────────────────────────────────────────────────────────
+
+model Comment {
+  id        String   @id @default(cuid())
+  taskId    String   @map("task_id")
+  authorId  String   @map("author_id")
+  content   String
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  task   Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  author User @relation(fields: [authorId], references: [id])
+
+  @@map("comments")
+}
+
+// ─── Notifications ───────────────────────────────────────────────────────────
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String           @map("user_id")
+  type      NotificationType
+  content   String
+  taskId    String?          @map("task_id")
+  read      Boolean          @default(false)
+  createdAt DateTime         @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("notifications")
+}
+
+// ─── Reports ─────────────────────────────────────────────────────────────────
+
+model Report {
+  id              String       @id @default(cuid())
+  userId          String       @map("user_id")
+  periodStart     DateTime     @map("period_start")
+  periodEnd       DateTime     @map("period_end")
+  comment         String?
+  status          ReportStatus @default(DRAFT)
+  approvedById    String?      @map("approved_by")
+  managerComment  String?      @map("manager_comment")
+  createdAt       DateTime     @default(now()) @map("created_at")
+  updatedAt       DateTime     @updatedAt @map("updated_at")
+
+  user       User  @relation("ReportUser", fields: [userId], references: [id])
+  approvedBy User? @relation("ReportApprover", fields: [approvedById], references: [id])
+
+  @@map("reports")
+}
+
+// ─── Weekly Goals ─────────────────────────────────────────────────────────────
+
+model WeeklyGoal {
+  id          String     @id @default(cuid())
+  userId      String     @map("user_id")
+  managerId   String     @map("manager_id")
+  title       String
+  description String?
+  status      GoalStatus @default(NOT_DONE)
+  weekStart   DateTime   @map("week_start")
+  createdAt   DateTime   @default(now()) @map("created_at")
+  updatedAt   DateTime   @updatedAt @map("updated_at")
+
+  user      User           @relation("GoalEmployee", fields: [userId], references: [id])
+  manager   User           @relation("GoalManager", fields: [managerId], references: [id])
+  taskLinks GoalTaskLink[]
+
+  @@map("weekly_goals")
+}
+
+model GoalTaskLink {
+  goalId String @map("goal_id")
+  taskId String @map("task_id")
+
+  goal WeeklyGoal @relation(fields: [goalId], references: [id], onDelete: Cascade)
+  task Task       @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@id([goalId, taskId])
+  @@map("goal_task_links")
+}
+
+// ─── Intake Pipeline ─────────────────────────────────────────────────────────
+
+model Intake {
+  id           String       @id @default(cuid())
+  createdById  String       @map("created_by")
+  fileType     String?      @map("file_type") // audio, pdf, text, manual
+  filePath     String?      @map("file_path")
+  originalName String?      @map("original_name")
+  transcript   String?
+  meetingNotes String?      @map("meeting_notes")
+  rawText      String?      @map("raw_text")
+  status       IntakeStatus @default(PENDING)
+  createdAt    DateTime     @default(now()) @map("created_at")
+  updatedAt    DateTime     @updatedAt @map("updated_at")
+
+  createdBy   User         @relation(fields: [createdById], references: [id])
+  intakeTasks IntakeTask[]
+
+  @@map("intakes")
+}
+
+model IntakeTask {
+  id          String   @id @default(cuid())
+  intakeId    String   @map("intake_id")
+  title       String
+  description String?
+  assigneeId  String?  @map("assignee_id")
+  projectId   String?  @map("project_id")
+  confirmed   Boolean  @default(false)
+  taskId      String?  @map("task_id") // linked task after confirmation
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  intake Intake @relation(fields: [intakeId], references: [id], onDelete: Cascade)
+  task   Task?  @relation(fields: [taskId], references: [id])
+
+  @@map("intake_tasks")
+}
+
+// ─── Audit Log ────────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  taskId    String   @map("task_id")
+  userId    String   @map("user_id")
+  action    String   // e.g. "status_changed", "assignee_changed"
+  oldValue  String?  @map("old_value")
+  newValue  String?  @map("new_value")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id])
+
+  @@map("audit_logs")
+}

@@ -1,0 +1,79 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: techtcb-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-techtcb}
+      POSTGRES_USER: ${POSTGRES_USER:-techtcb}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-techtcb_secret}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-techtcb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - techtcb
+
+  backend:
+    build:
+      context: ./src/backend
+      dockerfile: Dockerfile
+    container_name: techtcb-backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-techtcb}:${POSTGRES_PASSWORD:-techtcb_secret}@postgres:5432/${POSTGRES_DB:-techtcb}
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      PORT: 3001
+      NODE_ENV: ${NODE_ENV:-production}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
+    volumes:
+      - uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - techtcb
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3001/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./src/frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: /api
+    container_name: techtcb-frontend
+    restart: unless-stopped
+    networks:
+      - techtcb
+
+  nginx:
+    image: nginx:alpine
+    container_name: techtcb-nginx
+    restart: unless-stopped
+    ports:
+      - "${PORT:-80}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - techtcb
+
+volumes:
+  postgres_data:
+  uploads:
+
+networks:
+  techtcb:
+    driver: bridge

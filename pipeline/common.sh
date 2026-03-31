@@ -240,12 +240,22 @@ comment_on_issue() {
     local issue_number="$1"
     local body="$2"
 
-    gh api "repos/${PIPELINE_REPO}/issues/${issue_number}/comments" \
+    # Используем --raw-field для корректной передачи спецсимволов
+    if gh api "repos/${PIPELINE_REPO}/issues/${issue_number}/comments" \
         --method POST \
-        --field "body=${body}" \
-        > /dev/null
-
-    log "Комментарий к issue #${issue_number} опубликован"
+        --raw-field "body=${body}" \
+        > /dev/null 2>&1; then
+        log "Комментарий к issue #${issue_number} опубликован"
+    else
+        log "ERROR: Не удалось опубликовать комментарий к issue #${issue_number}"
+        # Fallback: попробовать с jq-экранированием
+        local escaped_body
+        escaped_body=$(echo "${body}" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" 2>/dev/null || echo ""${body}"")
+        gh api "repos/${PIPELINE_REPO}/issues/${issue_number}/comments" \
+            --method POST \
+            --input - <<< "{"body": ${escaped_body}}" \
+            > /dev/null 2>&1 && log "Комментарий опубликован (fallback)" || log "ERROR: Fallback тоже не сработал"
+    fi
 }
 
 # unassign_issue <issue_number>
