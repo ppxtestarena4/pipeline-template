@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # tester-daemon.sh — Агент-тестировщик (Tester)
-# Берёт задачи из колонки "Testing", проверяет соответствие спека-чеклисту,
-# запускает тесты, выносит вердикт PASS/FAIL.
+# Берёт задачи из колонки "Testing", запускает runtime-проверки,
+# выносит вердикт PASS/FAIL.
 # При PASS — создаёт PR и перемещает в Done.
 # Запускается через systemd (bravo-tester.service).
+#
+# ОТВЕТСТВЕННОСТЬ: Runtime-тесты (docker, curl, pytest, npm test)
+# Статический code review — задача Reviewer.
 
 set -euo pipefail
 
@@ -26,7 +29,6 @@ CODEX_TIMEOUT=900                          # 15 минут максимум на
 # ---------------------------------------------------------------------------
 
 # create_pull_request <branch_name> <issue_number>
-# Создаёт Pull Request из feature-ветки в main
 create_pull_request() {
     local branch_name="$1"
     local issue_number="$2"
@@ -38,7 +40,7 @@ create_pull_request() {
     pr_body=$(cat <<BODY
 ## Описание
 
-Автоматически созданный Pull Request по результатам прохождения всего конвейера.
+Автоматически созданный Pull Request по результатам прохождения конвейера.
 
 **Реализует:** #${issue_number} — ${issue_title}
 
@@ -46,7 +48,7 @@ create_pull_request() {
 
 - [x] Coder: реализация завершена
 - [x] Reviewer: код прошёл ревью
-- [x] Tester: все тесты пройдены
+- [x] Tester: тесты пройдены
 
 Closes #${issue_number}
 BODY
@@ -85,7 +87,7 @@ process_testing() {
     issue_spec=$(get_issue_body "${issue_number}")
     log "Спецификация получена (${#issue_spec} символов)"
 
-    # 3. Переключиться на feature-ветку и получить код
+    # 3. Переключиться на feature-ветку
     local branch_name="feature/issue-${issue_number}"
     cd "${REPO_DIR:-$(git rev-parse --show-toplevel)}"
 
@@ -93,7 +95,7 @@ process_testing() {
 
     if ! git ls-remote --exit-code --heads origin "${branch_name}" > /dev/null 2>&1; then
         log "ERROR: Ветка ${branch_name} не найдена"
-        comment_on_issue "${issue_number}" "❌ **Tester**: ветка \`${branch_name}\` не найдена. Невозможно выполнить тестирование."
+        comment_on_issue "${issue_number}" "❌ **Tester**: ветка \`${branch_name}\` не найдена."
         move_issue_to_status "${item_id}" "In Progress"
         unassign_issue "${issue_number}"
         return 1
@@ -102,45 +104,126 @@ process_testing() {
     git checkout "${branch_name}" --quiet
     git pull origin "${branch_name}" --quiet
 
-    # 4. Получить список и содержимое изменённых файлов
-    local changed_files
-    changed_files=$(git diff --name-only "origin/main...HEAD" 2>/dev/null || git diff --name-only HEAD~1 HEAD)
+    # 4. Получить список изменённых файлов (multi-strategy)
+    local changed_files=""
+
+    changed_files=$(git diff --name-only "origin/main...HEAD" 2>/dev/null || true)
+
+    if [[ -z "${changed_files}" ]]; then
+        log "WARN: diff origin/main...HEAD пуст. Пробуем HEAD~1."
+        changed_files=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || true)
+    fi
+
+    if [[ -z "${changed_files}" ]]; then
+        log "WARN: Ищем коммит issue #${issue_number} в main."
+        local impl_commit
+        impl_commit=$(git log origin/main --oneline --grep="implement issue #${issue_number}" -1 --format="%H" 2>/dev/null || true)
+        if [[ -n "${impl_commit}" ]]; then
+            changed_files=$(git diff --name-only "${impl_commit}~1" "${impl_commit}" 2>/dev/null || true)
+            if [[ -n "${changed_files}" ]]; then
+                git checkout "${impl_commit}" --quiet 2>/dev/null || true
+            fi
+        fi
+    fi
 
     local files_content=""
     while IFS= read -r file; do
         if [[ -f "${file}" ]]; then
-            files_content+=$'\n\n'"=== Файл: ${file} ===\n"
+            files_content+=$'\n\n'"=== Файл: ${file} ==="$'\n'
             files_content+=$(cat "${file}")
         fi
     done <<< "${changed_files}"
 
-    # 5. Попробовать запустить реальные тесты (если есть)
-    local test_results="Автоматические тесты не обнаружены в репозитории."
+    # 5. Запустить реальные тесты
+    local test_results="Результаты runtime-тестов:"
+    local any_test_ran=false
 
-    if [[ -f "tests/run_tests.sh" ]]; then
-        log "Найден tests/run_tests.sh, запускаем..."
-        test_results=$(bash tests/run_tests.sh 2>&1) || {
-            log "Тесты завершились с ошибкой"
-            test_results="ОШИБКА ЗАПУСКА ТЕСТОВ:\n${test_results}"
-        }
-    elif [[ -f "pytest.ini" ]] || [[ -f "setup.cfg" ]] || find . -name "test_*.py" -maxdepth 3 | grep -q .; then
-        log "Найдены pytest-тесты, запускаем..."
-        test_results=$(python -m pytest --tb=short 2>&1) || {
-            log "pytest завершился с ошибкой"
-        }
-    elif find . -name "*.test.js" -maxdepth 4 | grep -q . || [[ -f "package.json" ]]; then
-        if command -v npm &>/dev/null && grep -q '"test"' package.json 2>/dev/null; then
-            log "Найдены npm-тесты, запускаем..."
-            test_results=$(npm test 2>&1) || {
-                log "npm test завершился с ошибкой"
+    # 5a. Docker Compose (если есть docker-compose.yml)
+    if [[ -f "docker-compose.yml" ]] || [[ -f "docker-compose.yaml" ]]; then
+        if command -v docker &>/dev/null; then
+            log "Найден docker-compose.yml, пробуем docker compose build..."
+            local docker_build_result
+            docker_build_result=$(docker compose build 2>&1) && {
+                test_results+="\n\n### Docker Build: SUCCESS"
+                any_test_ran=true
+
+                log "Docker build OK. Пробуем docker compose up..."
+                docker compose up -d 2>&1
+                sleep 10
+
+                # Проверяем health endpoint
+                if curl -sf http://localhost:8000/health > /dev/null 2>&1; then
+                    local health_response
+                    health_response=$(curl -s http://localhost:8000/health)
+                    test_results+="\n### GET /health: SUCCESS — ${health_response}"
+                else
+                    test_results+="\n### GET /health: FAILED (сервис не ответил)"
+                fi
+
+                # Проверяем PostgreSQL
+                if docker compose exec -T db pg_isready 2>/dev/null; then
+                    test_results+="\n### PostgreSQL: READY"
+                else
+                    test_results+="\n### PostgreSQL: NOT READY или не настроен"
+                fi
+
+                # Cleanup
+                docker compose down 2>/dev/null || true
+            } || {
+                test_results+="\n\n### Docker Build: FAILED\n${docker_build_result}"
+                any_test_ran=true
             }
+        else
+            test_results+="\n\n### Docker: не установлен на VPS"
         fi
     fi
 
-    # 6. Запустить Codex как тестировщика
+    # 5b. pytest
+    if find . -name "test_*.py" -maxdepth 3 2>/dev/null | grep -q .; then
+        log "Найдены pytest-тесты, запускаем..."
+        local pytest_result
+        pytest_result=$(python3 -m pytest --tb=short 2>&1) || true
+        test_results+="\n\n### pytest:\n${pytest_result}"
+        any_test_ran=true
+    fi
+
+    # 5c. npm test
+    if [[ -f "package.json" ]] && grep -q '"test"' package.json 2>/dev/null; then
+        log "Найдены npm-тесты, запускаем..."
+        local npm_result
+        npm_result=$(npm test 2>&1) || true
+        test_results+="\n\n### npm test:\n${npm_result}"
+        any_test_ran=true
+    fi
+
+    # 5d. Python syntax check для всех .py файлов
+    if echo "${changed_files}" | grep -q '\.py$'; then
+        log "Проверяем синтаксис Python-файлов..."
+        local syntax_ok=true
+        while IFS= read -r pyfile; do
+            if [[ -f "${pyfile}" ]]; then
+                if ! python3 -m py_compile "${pyfile}" 2>/dev/null; then
+                    test_results+="\n### Syntax ERROR: ${pyfile}"
+                    syntax_ok=false
+                fi
+            fi
+        done <<< "$(echo "${changed_files}" | grep '\.py$')"
+        if [[ "${syntax_ok}" == true ]]; then
+            test_results+="\n\n### Python syntax: OK (все файлы валидны)"
+        fi
+        any_test_ran=true
+    fi
+
+    if [[ "${any_test_ran}" == false ]]; then
+        test_results+="\n\nАвтоматические тесты не обнаружены."
+    fi
+
+    log "Runtime-тесты завершены"
+
+    # 6. Запустить Codex для финальной оценки
     local codex_prompt
     codex_prompt=$(cat <<PROMPT
-Ты — опытный QA-тестировщик. Проверь реализацию на соответствие спецификации.
+Ты — опытный QA-тестировщик. Оцени результаты тестирования.
 
 ## Спецификация задачи (Issue #${issue_number})
 
@@ -150,59 +233,60 @@ ${issue_spec}
 
 ${files_content}
 
-## Результаты автоматических тестов
+## Результаты runtime-тестов
 
 ${test_results}
 
-## Задача тестирования
+## Задача
 
-Проверь следующее:
-1. **Спека-чеклист** — каждый пункт "Критерии готовности" из issue выполнен?
-2. **Gate: Coder → QA** — все файлы из чеклиста существуют?
-3. **Gate: QA → Review** — код соответствует спецификации?
-4. **Функциональность** — реализованный код логически правильный?
-5. **Результаты тестов** — автоматические тесты прошли (если были)?
-6. **Граничные случаи** — обработаны ли ошибки и граничные случаи?
+На основе кода и результатов тестов определи:
+1. **Критерии готовности** из issue — выполнены ли по коду и тестам?
+2. **Gate** — все файлы существуют, код соответствует спецификации?
+3. **Runtime** — тесты прошли или есть ошибки?
+
+## ВАЖНЫЕ ПРАВИЛА
+
+- Если docker/runtime тесты не запускались (нет docker-compose.yml для этой задачи) — это НЕ причина для FAIL
+- Если синтаксис Python OK и код соответствует спецификации — это PASS
+- FAIL только если: код не соответствует спецификации, критические баги, тесты упали
 
 ## Формат ответа
 
-Дай подробный отчёт по каждому пункту. В ПОСЛЕДНЕЙ строке напиши ТОЛЬКО одно:
+Краткий отчёт и в ПОСЛЕДНЕЙ строке ТОЛЬКО:
 VERDICT: PASS
 VERDICT: FAIL
-
-При FAIL укажи конкретно, что не соответствует спецификации.
 PROMPT
 )
 
-    log "Запускаем codex exec для тестирования issue #${issue_number}..."
+    log "Запускаем Codex для оценки issue #${issue_number}..."
 
     local test_output=""
     local codex_exit=0
 
-    test_output=$(timeout "${CODEX_TIMEOUT}" codex exec --full-auto "${codex_prompt}" 2>&1) || codex_exit=$?
+    test_output=$(timeout "${CODEX_TIMEOUT}" codex exec --full-auto --skip-git-repo-check "${codex_prompt}" 2>&1) || codex_exit=$?
 
     if [[ ${codex_exit} -eq 124 ]]; then
-        log "ERROR: codex exec превысил таймаут для тестирования issue #${issue_number}"
-        comment_on_issue "${issue_number}" "❌ **Tester**: превышен таймаут тестирования (15 мин). Задача возвращена в In Progress."
+        log "ERROR: Codex превысил таймаут для issue #${issue_number}"
+        comment_on_issue "${issue_number}" "❌ **Tester**: превышен таймаут (15 мин). Задача возвращена в In Progress."
         move_issue_to_status "${item_id}" "In Progress"
         unassign_issue "${issue_number}"
         return 1
     elif [[ ${codex_exit} -ne 0 ]]; then
-        log "ERROR: codex exec завершился с кодом ${codex_exit}"
-        comment_on_issue "${issue_number}" "❌ **Tester**: ошибка при выполнении тестирования (exit ${codex_exit}). Задача возвращена в In Progress."
+        log "ERROR: Codex завершился с кодом ${codex_exit}"
+        comment_on_issue "${issue_number}" "❌ **Tester**: ошибка (exit ${codex_exit}). Задача возвращена в In Progress."
         move_issue_to_status "${item_id}" "In Progress"
         unassign_issue "${issue_number}"
         return 1
     fi
 
-    log "Codex завершил тестирование. Анализируем вердикт..."
+    log "Codex завершил оценку. Анализируем вердикт..."
 
     # 7. Парсим вердикт
     local verdict=""
     verdict=$(echo "${test_output}" | grep -o 'VERDICT: \(PASS\|FAIL\)' | tail -n 1 | awk '{print $2}')
 
     if [[ -z "${verdict}" ]]; then
-        log "WARN: Вердикт не найден в выводе codex. Считаем FAIL."
+        log "WARN: Вердикт не найден. Считаем FAIL."
         verdict="FAIL"
     fi
 
@@ -210,39 +294,42 @@ PROMPT
 
     # 8. Действие по вердикту
     if [[ "${verdict}" == "PASS" ]]; then
-        # Переместить в Done
         move_issue_to_status "${item_id}" "Done"
         log "Issue #${issue_number} → Done"
 
-        # Создать Pull Request
         local pr_url
         pr_url=$(create_pull_request "${branch_name}" "${issue_number}")
         log "Pull Request создан: ${pr_url}"
 
-        comment_on_issue "${issue_number}" "✅ **Tester**: все тесты пройдены!
+        comment_on_issue "${issue_number}" "✅ **Tester**: тестирование пройдено!
 
-**Отчёт тестирования:**
+**Runtime-тесты:**
+$(echo -e "${test_results}")
+
+**Оценка Codex:**
 ${test_output}
 
 **Pull Request:** ${pr_url}
 
-Задача перемещена в **Done**. Ожидается финальная проверка человеком."
+Задача перемещена в **Done**."
 
-        log "=== Issue #${issue_number} прошёл тестирование → Done ==="
+        log "=== Issue #${issue_number} → Done ==="
 
     else
-        # Вернуть в In Progress
         move_issue_to_status "${item_id}" "In Progress"
-        log "Issue #${issue_number} → In Progress (тестирование не пройдено)"
+        log "Issue #${issue_number} → In Progress (тесты не пройдены)"
 
-        comment_on_issue "${issue_number}" "🔄 **Tester**: тестирование не пройдено. Требуются исправления.
+        comment_on_issue "${issue_number}" "🔄 **Tester**: тестирование не пройдено.
 
-**Отчёт тестирования:**
+**Runtime-тесты:**
+$(echo -e "${test_results}")
+
+**Оценка Codex:**
 ${test_output}
 
-Задача возвращена в **In Progress** для исправления."
+Задача возвращена в **In Progress**."
 
-        log "=== Issue #${issue_number} не прошёл тестирование, возвращён в In Progress ==="
+        log "=== Issue #${issue_number} не прошёл тестирование ==="
     fi
 
     unassign_issue "${issue_number}"
@@ -257,12 +344,12 @@ main() {
     log "============================================"
     log "Tester Daemon запущен. Репозиторий: ${PIPELINE_REPO}"
     log "Интервал опроса: ${SLEEP_INTERVAL}s"
+    log "Режим: Runtime-тесты (docker, pytest, syntax)"
     log "============================================"
 
     while true; do
         log "--- Новая итерация ---"
 
-        # Найти первую незанятую задачу в "Testing"
         local task_line=""
         task_line=$(get_first_item_by_status "Testing" 2>/dev/null || true)
 
@@ -276,7 +363,7 @@ main() {
             log "Найдена задача для тестирования: issue #${issue_number} (item: ${item_id})"
 
             if ! process_testing "${item_id}" "${issue_number}"; then
-                log "ERROR: Тестирование issue #${issue_number} завершилось с ошибкой. Продолжаем цикл."
+                log "ERROR: Тестирование issue #${issue_number} завершилось с ошибкой."
             fi
         fi
 
