@@ -56,9 +56,31 @@ process_review() {
     git checkout "${branch_name}" --quiet
     git pull origin "${branch_name}" --quiet
 
-    # Получить список и содержимое изменённых файлов
-    local changed_files
-    changed_files=$(git diff --name-only "origin/main...HEAD" 2>/dev/null || git diff --name-only HEAD~1 HEAD)
+    # Получить список изменённых файлов (несколько стратегий)
+    local changed_files=""
+
+    # Стратегия 1: diff feature-ветки vs origin/main
+    changed_files=$(git diff --name-only "origin/main...HEAD" 2>/dev/null || true)
+
+    # Стратегия 2: если пусто — последний коммит
+    if [[ -z "${changed_files}" ]]; then
+        log "WARN: diff origin/main...HEAD пуст. Пробуем HEAD~1."
+        changed_files=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || true)
+    fi
+
+    # Стратегия 3: коммит мог попасть в main напрямую
+    if [[ -z "${changed_files}" ]]; then
+        log "WARN: Ищем коммит issue #${issue_number} в main."
+        local impl_commit
+        impl_commit=$(git log origin/main --oneline --grep="implement issue #${issue_number}" -1 --format="%H" 2>/dev/null || true)
+        if [[ -n "${impl_commit}" ]]; then
+            log "Найден коммит в main: ${impl_commit}"
+            changed_files=$(git diff --name-only "${impl_commit}~1" "${impl_commit}" 2>/dev/null || true)
+            if [[ -n "${changed_files}" ]]; then
+                git checkout "${impl_commit}" --quiet 2>/dev/null || true
+            fi
+        fi
+    fi
 
     if [[ -z "${changed_files}" ]]; then
         log "ERROR: Нет изменённых файлов в ветке ${branch_name}"
