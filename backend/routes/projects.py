@@ -22,9 +22,9 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import UUID as SQLAlchemyUUID
 from sqlalchemy.orm import Session
 
-from backend.database import Base, get_db
-from backend.models import User
-from backend.schemas import ProjectCreate, ProjectMemberAdd, ProjectResponse, ProjectUpdate, UserBrief
+from database import Base, get_db
+from models import User
+from schemas import ProjectCreate, ProjectMemberAdd, ProjectResponse, ProjectUpdate, UserBrief
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 security = HTTPBearer(auto_error=False)
