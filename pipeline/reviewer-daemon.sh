@@ -3,6 +3,9 @@
 # Берёт задачи из колонки "Review", проверяет код на соответствие спецификации,
 # выносит вердикт PASS/FAIL и перемещает задачу в Testing или обратно в In Progress.
 # Запускается через systemd (bravo-reviewer.service).
+#
+# ВАЖНО: Reviewer выполняет СТАТИЧЕСКИЙ code review.
+# Runtime-проверки (docker, curl, тесты) — ответственность Tester.
 
 set -euo pipefail
 
@@ -84,7 +87,7 @@ process_review() {
 
     if [[ -z "${changed_files}" ]]; then
         log "ERROR: Нет изменённых файлов в ветке ${branch_name}"
-        comment_on_issue "${issue_number}" "❌ **Reviewer**: в ветке \`${branch_name}\` нет изменений относительно main. Возвращаем задачу в In Progress."
+        comment_on_issue "${issue_number}" "❌ **Reviewer**: в ветке \`${branch_name}\` нет изменений. Возвращаем в In Progress."
         move_issue_to_status "${item_id}" "In Progress"
         unassign_issue "${issue_number}"
         return 1
@@ -96,15 +99,15 @@ process_review() {
     local files_content=""
     while IFS= read -r file; do
         if [[ -f "${file}" ]]; then
-            files_content+=$'\n\n'"=== Файл: ${file} ===\n"
+            files_content+=$'\n\n'"=== Файл: ${file} ==="$'\n'
             files_content+=$(cat "${file}")
         fi
     done <<< "${changed_files}"
 
-    # 4. Запустить Codex как QA-ревьюер
+    # 4. Запустить Codex как ревьюер
     local codex_prompt
     codex_prompt=$(cat <<PROMPT
-Ты — опытный QA-инженер и технический ревьюер. Проведи code review.
+Ты — опытный технический ревьюер. Проведи СТАТИЧЕСКИЙ code review.
 
 ## Спецификация задачи (Issue #${issue_number})
 
@@ -116,39 +119,58 @@ ${files_content}
 
 ## Задача ревью
 
-Проверь следующее:
-1. **Соответствие спецификации** — весь ли функционал из спецификации реализован?
+Проверь ТОЛЬКО следующее (статический анализ кода, БЕЗ запуска):
+1. **Соответствие спецификации** — созданы ли все файлы из спецификации? Реализован ли описанный функционал?
 2. **Качество кода** — читаемость, структура, отсутствие дублирования
-3. **Безопасность** — нет ли очевидных уязвимостей (инъекции, открытые секреты, небезопасные операции)
-4. **Обработка ошибок** — корректно ли обрабатываются ошибки?
-5. **Чеклист из issue** — выполнены ли все пункты "Критерии готовности"?
+3. **Безопасность** — нет ли очевидных уязвимостей (инъекции, открытые секреты)
+4. **Обработка ошибок** — корректно ли обрабатываются ошибки в коде?
+5. **Синтаксис** — нет ли синтаксических ошибок?
+
+## ВАЖНЫЕ ПРАВИЛА
+
+- НЕ пытайся запускать код, docker, curl или любые runtime-команды
+- НЕ проверяй доступность docker, PostgreSQL или других сервисов — это задача Tester
+- НЕ ставь FAIL только потому, что не можешь запустить приложение
+- Оценивай ТОЛЬКО исходный код, который тебе предоставлен
+- Критерии типа "GET /health -> 200" проверяй по КОДУ (есть ли эндпоинт), а не по runtime
+- Если код соответствует спецификации и не содержит критических ошибок — ставь PASS
 
 ## Формат ответа
 
-Дай структурированный отчёт и в ПОСЛЕДНЕЙ строке напиши ТОЛЬКО одно из двух:
+Дай краткий структурированный отчёт и в ПОСЛЕДНЕЙ строке напиши ТОЛЬКО одно из двух:
 VERDICT: PASS
 VERDICT: FAIL
 
-При FAIL обязательно укажи конкретные проблемы, которые нужно исправить.
+FAIL — только при КРИТИЧЕСКИХ проблемах в КОДЕ:
+- Файлы из спецификации не созданы
+- Ключевой функционал не реализован
+- Критические баги в логике
+- Серьёзные уязвимости безопасности
+
+НЕ является причиной для FAIL:
+- Невозможность запустить docker/сервисы
+- Отсутствие runtime-подтверждения
+- Мелкие стилистические замечания
+- Рекомендации по улучшению
 PROMPT
 )
 
-    log "Запускаем codex exec для ревью issue #${issue_number}..."
+    log "Запускаем Codex для ревью issue #${issue_number}..."
 
     local review_output=""
     local codex_exit=0
 
-    review_output=$(timeout "${CODEX_TIMEOUT}" codex exec --full-auto "${codex_prompt}" 2>&1) || codex_exit=$?
+    review_output=$(timeout "${CODEX_TIMEOUT}" codex exec --full-auto --skip-git-repo-check "${codex_prompt}" 2>&1) || codex_exit=$?
 
     if [[ ${codex_exit} -eq 124 ]]; then
-        log "ERROR: codex exec превысил таймаут для ревью issue #${issue_number}"
+        log "ERROR: Codex превысил таймаут для ревью issue #${issue_number}"
         comment_on_issue "${issue_number}" "❌ **Reviewer**: превышен таймаут ревью (15 мин). Задача возвращена в In Progress."
         move_issue_to_status "${item_id}" "In Progress"
         unassign_issue "${issue_number}"
         return 1
     elif [[ ${codex_exit} -ne 0 ]]; then
-        log "ERROR: codex exec завершился с кодом ${codex_exit}"
-        comment_on_issue "${issue_number}" "❌ **Reviewer**: ошибка при выполнении ревью (exit ${codex_exit}). Задача возвращена в In Progress."
+        log "ERROR: Codex завершился с кодом ${codex_exit}"
+        comment_on_issue "${issue_number}" "❌ **Reviewer**: ошибка при ревью (exit ${codex_exit}). Задача возвращена в In Progress."
         move_issue_to_status "${item_id}" "In Progress"
         unassign_issue "${issue_number}"
         return 1
@@ -156,12 +178,12 @@ PROMPT
 
     log "Codex завершил ревью. Анализируем вердикт..."
 
-    # 5. Парсим вердикт из последней строки
+    # 5. Парсим вердикт
     local verdict=""
     verdict=$(echo "${review_output}" | grep -o 'VERDICT: \(PASS\|FAIL\)' | tail -n 1 | awk '{print $2}')
 
     if [[ -z "${verdict}" ]]; then
-        log "WARN: Вердикт не найден в выводе codex. Считаем FAIL."
+        log "WARN: Вердикт не найден в выводе Codex. Считаем FAIL."
         verdict="FAIL"
     fi
 
@@ -207,12 +229,13 @@ main() {
     log "============================================"
     log "Reviewer Daemon запущен. Репозиторий: ${PIPELINE_REPO}"
     log "Интервал опроса: ${SLEEP_INTERVAL}s"
+    log "Режим: СТАТИЧЕСКИЙ code review (без runtime)"
     log "============================================"
 
     while true; do
         log "--- Новая итерация ---"
 
-        # Найти первую незанятую задачу в "Review"
+        # Найти первую задачу в "Review" (любую, включая assigned)
         local task_line=""
         task_line=$(get_first_item_by_status "Review" 2>/dev/null || true)
 
