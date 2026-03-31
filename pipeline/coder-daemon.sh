@@ -140,6 +140,13 @@ process_task() {
 
     log "=== Начало обработки issue #${issue_number} (item: ${item_id}) ==="
 
+    # 0. Очистка рабочей директории — предотвращает утечку между задачами
+    cd "${REPO_DIR:-$(git rev-parse --show-toplevel)}"
+    git checkout main --quiet 2>/dev/null || true
+    git reset --hard origin/main --quiet 2>/dev/null || true
+    git clean -fdx --quiet 2>/dev/null || true
+    log "Рабочая директория очищена"
+
     # 1. Назначить issue на себя
     assign_issue "${issue_number}"
 
