@@ -5,6 +5,7 @@ from .project import (
     ProjectUpdate,
     UserBrief,
 )
+from .task import TaskCreate, TaskUpdate, TaskMove, TaskResponse
 
 __all__ = [
     "ProjectCreate",
@@ -12,4 +13,8 @@ __all__ = [
     "ProjectResponse",
     "ProjectUpdate",
     "UserBrief",
+    "TaskCreate",
+    "TaskUpdate",
+    "TaskMove",
+    "TaskResponse",
 ]

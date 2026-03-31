@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from backend.database import Base, engine
-from backend.routes import projects_router
+from backend.routes import projects_router, tasks_router
 
 app = FastAPI(title="TaskApp API", version="0.1.0")
 
@@ -11,6 +11,7 @@ def on_startup() -> None:
 
 
 app.include_router(projects_router)
+app.include_router(tasks_router)
 
 
 @app.get("/health")
