@@ -300,3 +300,115 @@ check_dependencies() {
         exit 1
     fi
 }
+
+# get_first_item_by_status <status_name>
+# Возвращает первую задачу в колонке (любую, включая assigned): "ITEM_ID ISSUE_NUMBER"
+# Используется Reviewer и Tester, которые сами управляют назначением.
+get_first_item_by_status() {
+    local status_name="$1"
+    local column_id="${COLUMN_IDS[${status_name}]:-}"
+
+    if [[ -z "${column_id}" ]]; then
+        log "ERROR: Неизвестный статус: ${status_name}"
+        return 1
+    fi
+
+    local query
+    query=$(cat <<GRAPHQL
+{
+  node(id: "${PROJECT_ID}") {
+    ... on ProjectV2 {
+      items(first: 50) {
+        nodes {
+          id
+          fieldValues(first: 20) {
+            nodes {
+              ... on ProjectV2ItemFieldSingleSelectValue {
+                optionId
+                field {
+                  ... on ProjectV2FieldCommon {
+                    id
+                  }
+                }
+              }
+            }
+          }
+          content {
+            ... on Issue {
+              number
+              state
+            }
+          }
+        }
+      }
+    }
+  }
+}
+GRAPHQL
+)
+
+    gh api graphql -f query="${query}" \
+        --jq ".data.node.items.nodes[] |
+              select(.content.state == \"OPEN\") |
+              select(.fieldValues.nodes[] |
+                select(.field.id == \"${STATUS_FIELD_ID}\" and .optionId == \"${column_id}\")
+              ) |
+              \"\(.id) \(.content.number)\"" \
+        | head -n 1
+}
+
+# get_first_item_by_status <status_name>
+# Возвращает первую задачу в колонке (любую, включая assigned): "ITEM_ID ISSUE_NUMBER"
+# Используется Reviewer и Tester, которые сами управляют назначением.
+get_first_item_by_status() {
+    local status_name="$1"
+    local column_id="${COLUMN_IDS[${status_name}]:-}"
+
+    if [[ -z "${column_id}" ]]; then
+        log "ERROR: Неизвестный статус: ${status_name}"
+        return 1
+    fi
+
+    local query
+    query=$(cat <<GRAPHQL
+{
+  node(id: "${PROJECT_ID}") {
+    ... on ProjectV2 {
+      items(first: 50) {
+        nodes {
+          id
+          fieldValues(first: 20) {
+            nodes {
+              ... on ProjectV2ItemFieldSingleSelectValue {
+                optionId
+                field {
+                  ... on ProjectV2FieldCommon {
+                    id
+                  }
+                }
+              }
+            }
+          }
+          content {
+            ... on Issue {
+              number
+              state
+            }
+          }
+        }
+      }
+    }
+  }
+}
+GRAPHQL
+)
+
+    gh api graphql -f query="${query}" \
+        --jq ".data.node.items.nodes[] |
+              select(.content.state == \"OPEN\") |
+              select(.fieldValues.nodes[] |
+                select(.field.id == \"${STATUS_FIELD_ID}\" and .optionId == \"${column_id}\")
+              ) |
+              \"\(.id) \(.content.number)\"" \
+        | head -n 1
+}

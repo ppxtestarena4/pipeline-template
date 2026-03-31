@@ -264,7 +264,7 @@ main() {
 
         # Найти первую незанятую задачу в "Testing"
         local task_line=""
-        task_line=$(get_first_unassigned_item_by_status "Testing" 2>/dev/null || true)
+        task_line=$(get_first_item_by_status "Testing" 2>/dev/null || true)
 
         if [[ -z "${task_line}" ]]; then
             log "Нет задач в 'Testing'. Ожидание ${SLEEP_INTERVAL}s..."

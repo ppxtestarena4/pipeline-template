@@ -287,6 +287,12 @@ MSG
     move_issue_to_status "${item_id}" "Review"
     log "Issue #${issue_number} → Review"
 
+    # 8a. Снять назначение — чтобы Reviewer мог подхватить задачу
+    unassign_issue "${issue_number}"
+
+    # 8a. Снять назначение — чтобы Reviewer мог подхватить задачу
+    unassign_issue "${issue_number}"
+
     # 9. Оставить комментарий
     local changed_files
     changed_files=$(git diff --name-only HEAD~1 HEAD | sed 's/^/- /')
