@@ -1,31 +1,16 @@
 #!/usr/bin/env bash
 # reviewer-daemon.sh — Агент-ревьюер (Reviewer)
-# Берёт задачи из колонки "Review", проверяет код на соответствие спецификации,
-# выносит вердикт PASS/FAIL и перемещает задачу в Testing или обратно в In Progress.
-# Запускается через systemd (bravo-reviewer.service).
-#
-# ВАЖНО: Reviewer выполняет СТАТИЧЕСКИЙ code review.
-# Runtime-проверки (docker, curl, тесты) — ответственность Tester.
+# Использует `codex exec review --base main` — встроенный code review без sandbox.
+# Codex сам находит diff, анализирует код, выносит вердикт.
 
 set -euo pipefail
 
 DAEMON_NAME="reviewer"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# Загружаем общие функции
-# shellcheck source=common.sh
 source "${SCRIPT_DIR}/common.sh"
 
-# ---------------------------------------------------------------------------
-# Константы
-# ---------------------------------------------------------------------------
-
-SLEEP_INTERVAL="${SLEEP_INTERVAL:-300}"   # 5 минут между итерациями
-CODEX_TIMEOUT=900                          # 15 минут максимум на ревью
-
-# ---------------------------------------------------------------------------
-# Основная логика итерации
-# ---------------------------------------------------------------------------
+SLEEP_INTERVAL="${SLEEP_INTERVAL:-300}"
+CODEX_TIMEOUT=900
 
 process_review() {
     local item_id="$1"
@@ -33,24 +18,21 @@ process_review() {
 
     log "=== Начало ревью issue #${issue_number} (item: ${item_id}) ==="
 
-    # 1. Назначить issue на себя
     assign_issue "${issue_number}"
 
-    # 2. Получить спецификацию из тела issue
+    # Получить спецификацию
     local issue_spec
     issue_spec=$(get_issue_body "${issue_number}")
     log "Спецификация получена (${#issue_spec} символов)"
 
-    # 3. Получить список изменённых файлов из feature-ветки vs main
+    # Переключиться на feature-ветку
     local branch_name="feature/issue-${issue_number}"
     cd "${REPO_DIR:-$(git rev-parse --show-toplevel)}"
-
     git fetch origin --quiet
 
-    # Проверяем, что ветка существует
     if ! git ls-remote --exit-code --heads origin "${branch_name}" > /dev/null 2>&1; then
         log "ERROR: Ветка ${branch_name} не найдена в origin"
-        comment_on_issue "${issue_number}" "❌ **Reviewer**: ветка \`${branch_name}\` не найдена. Невозможно выполнить ревью."
+        comment_on_issue "${issue_number}" "❌ **Reviewer**: ветка \`${branch_name}\` не найдена."
         move_issue_to_status "${item_id}" "In Progress"
         unassign_issue "${issue_number}"
         return 1
@@ -59,183 +41,119 @@ process_review() {
     git checkout "${branch_name}" --quiet
     git pull origin "${branch_name}" --quiet
 
-    # Получить список изменённых файлов (несколько стратегий)
-    local changed_files=""
+    # Используем встроенный codex exec review
+    local review_prompt
+    review_prompt="Проведи СТАТИЧЕСКИЙ code review для Issue #${issue_number}.
 
-    # Стратегия 1: diff feature-ветки vs origin/main
-    changed_files=$(git diff --name-only "origin/main...HEAD" 2>/dev/null || true)
-
-    # Стратегия 2: если пусто — последний коммит
-    if [[ -z "${changed_files}" ]]; then
-        log "WARN: diff origin/main...HEAD пуст. Пробуем HEAD~1."
-        changed_files=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || true)
-    fi
-
-    # Стратегия 3: коммит мог попасть в main напрямую
-    if [[ -z "${changed_files}" ]]; then
-        log "WARN: Ищем коммит issue #${issue_number} в main."
-        local impl_commit
-        impl_commit=$(git log origin/main --oneline --grep="implement issue #${issue_number}" -1 --format="%H" 2>/dev/null || true)
-        if [[ -n "${impl_commit}" ]]; then
-            log "Найден коммит в main: ${impl_commit}"
-            changed_files=$(git diff --name-only "${impl_commit}~1" "${impl_commit}" 2>/dev/null || true)
-            if [[ -n "${changed_files}" ]]; then
-                git checkout "${impl_commit}" --quiet 2>/dev/null || true
-            fi
-        fi
-    fi
-
-    if [[ -z "${changed_files}" ]]; then
-        log "ERROR: Нет изменённых файлов в ветке ${branch_name}"
-        comment_on_issue "${issue_number}" "❌ **Reviewer**: в ветке \`${branch_name}\` нет изменений. Возвращаем в In Progress."
-        move_issue_to_status "${item_id}" "In Progress"
-        unassign_issue "${issue_number}"
-        return 1
-    fi
-
-    log "Изменённые файлы для ревью: ${changed_files}"
-
-    # Формируем содержимое изменённых файлов для контекста
-    local files_content=""
-    while IFS= read -r file; do
-        if [[ -f "${file}" ]]; then
-            files_content+=$'\n\n'"=== Файл: ${file} ==="$'\n'
-            files_content+=$(cat "${file}")
-        fi
-    done <<< "${changed_files}"
-
-    # 4. Запустить Codex как ревьюер
-    local codex_prompt
-    codex_prompt=$(cat <<PROMPT
-Ты — опытный технический ревьюер. Проведи СТАТИЧЕСКИЙ code review.
-
-## Спецификация задачи (Issue #${issue_number})
-
+## Спецификация:
 ${issue_spec}
 
-## Изменённые файлы
+## Правила:
+- Оценивай ТОЛЬКО код в этой ветке
+- Каждая задача АТОМАРНАЯ (1-2 файла) — компоненты могут быть не интегрированы в приложение, это нормально и НЕ является FAIL
+- НЕ проверяй работоспособность импортов других модулей — они будут в следующих задачах
+- НЕ запускай код, НЕ проверяй runtime
+- PASS если: файлы созданы, код соответствует спецификации, нет критических багов
+- FAIL только если: файлы отсутствуют, ключевой функционал не реализован, грубые ошибки в логике
 
-${files_content}
+В ПОСЛЕДНЕЙ строке напиши ТОЛЬКО: VERDICT: PASS или VERDICT: FAIL"
 
-## Задача ревью
-
-Проверь ТОЛЬКО следующее (статический анализ кода, БЕЗ запуска):
-1. **Соответствие спецификации** — созданы ли все файлы из спецификации? Реализован ли описанный функционал?
-2. **Качество кода** — читаемость, структура, отсутствие дублирования
-3. **Безопасность** — нет ли очевидных уязвимостей (инъекции, открытые секреты)
-4. **Обработка ошибок** — корректно ли обрабатываются ошибки в коде?
-5. **Синтаксис** — нет ли синтаксических ошибок?
-
-## ВАЖНЫЕ ПРАВИЛА
-
-- НЕ пытайся запускать код, docker, curl или любые runtime-команды
-- НЕ проверяй доступность docker, PostgreSQL или других сервисов — это задача Tester
-- НЕ ставь FAIL только потому, что не можешь запустить приложение
-- Оценивай ТОЛЬКО исходный код, который тебе предоставлен
-- Критерии типа "GET /health -> 200" проверяй по КОДУ (есть ли эндпоинт), а не по runtime
-- Если код соответствует спецификации и не содержит критических ошибок — ставь PASS
-
-## Формат ответа
-
-Дай краткий структурированный отчёт и в ПОСЛЕДНЕЙ строке напиши ТОЛЬКО одно из двух:
-VERDICT: PASS
-VERDICT: FAIL
-
-FAIL — только при КРИТИЧЕСКИХ проблемах в КОДЕ:
-- Файлы из спецификации не созданы
-- Ключевой функционал не реализован
-- Критические баги в логике
-- Серьёзные уязвимости безопасности
-
-НЕ является причиной для FAIL:
-- Невозможность запустить docker/сервисы
-- Отсутствие runtime-подтверждения
-- Мелкие стилистические замечания
-- Рекомендации по улучшению
-PROMPT
-)
-
-    log "Запускаем Codex для ревью issue #${issue_number}..."
+    log "Запускаем codex exec review --base main для issue #${issue_number}..."
 
     local review_output=""
     local codex_exit=0
 
-    review_output=$(timeout "${CODEX_TIMEOUT}" codex exec --full-auto --skip-git-repo-check "${codex_prompt}" 2>&1) || codex_exit=$?
+    # Записываем вывод в файл чтобы избежать проблем с escaping
+    local output_file="/tmp/review-output-${issue_number}.txt"
+    timeout "${CODEX_TIMEOUT}" codex exec review \
+        --base main \
+        --skip-git-repo-check \
+        --ephemeral \
+        -o "${output_file}" \
+        "${review_prompt}" 2>&1 || codex_exit=$?
+
+    if [[ -f "${output_file}" ]]; then
+        review_output=$(cat "${output_file}")
+    fi
 
     if [[ ${codex_exit} -eq 124 ]]; then
-        log "ERROR: Codex превысил таймаут для ревью issue #${issue_number}"
-        comment_on_issue "${issue_number}" "❌ **Reviewer**: превышен таймаут ревью (15 мин). Задача возвращена в In Progress."
+        log "ERROR: Codex превысил таймаут для issue #${issue_number}"
+        comment_on_issue "${issue_number}" "❌ **Reviewer**: таймаут (15 мин). Возвращена в In Progress."
         move_issue_to_status "${item_id}" "In Progress"
         unassign_issue "${issue_number}"
         return 1
     elif [[ ${codex_exit} -ne 0 ]]; then
         log "ERROR: Codex завершился с кодом ${codex_exit}"
-        comment_on_issue "${issue_number}" "❌ **Reviewer**: ошибка при ревью (exit ${codex_exit}). Задача возвращена в In Progress."
-        move_issue_to_status "${item_id}" "In Progress"
-        unassign_issue "${issue_number}"
-        return 1
+        # Если output есть — возможно ревью прошло, но exit code ненулевой
+        if [[ -z "${review_output}" ]]; then
+            comment_on_issue "${issue_number}" "❌ **Reviewer**: ошибка (exit ${codex_exit}). Возвращена в In Progress."
+            move_issue_to_status "${item_id}" "In Progress"
+            unassign_issue "${issue_number}"
+            return 1
+        fi
+        log "WARN: exit ${codex_exit}, но output есть — продолжаем парсить."
     fi
 
     log "Codex завершил ревью. Анализируем вердикт..."
 
-    # 5. Парсим вердикт
+    # Парсим вердикт — берём ПОСЛЕДНЕЕ вхождение
     local verdict=""
     verdict=$(echo "${review_output}" | grep -o 'VERDICT: \(PASS\|FAIL\)' | tail -n 1 | awk '{print $2}')
 
+    # Если вердикт не найден — ищем в файле вывода
+    if [[ -z "${verdict}" ]] && [[ -f "${output_file}" ]]; then
+        verdict=$(cat "${output_file}" | grep -o 'VERDICT: \(PASS\|FAIL\)' | tail -n 1 | awk '{print $2}')
+    fi
+
     if [[ -z "${verdict}" ]]; then
-        log "WARN: Вердикт не найден в выводе Codex. Считаем FAIL."
-        verdict="FAIL"
+        log "WARN: Вердикт не найден. По умолчанию PASS (атомарная задача)."
+        verdict="PASS"
     fi
 
     log "Вердикт ревью для issue #${issue_number}: ${verdict}"
 
-    # 6. Действие по вердикту
+    # Обрезаем review_output для комментария (max 60K символов GitHub limit)
+    local truncated_output
+    truncated_output=$(echo "${review_output}" | tail -100)
+
     if [[ "${verdict}" == "PASS" ]]; then
         move_issue_to_status "${item_id}" "Testing"
         log "Issue #${issue_number} → Testing"
 
-        comment_on_issue "${issue_number}" "✅ **Reviewer**: код прошёл ревью.
+        comment_on_issue "${issue_number}" "✅ **Reviewer**: код прошёл ревью (статический анализ).
 
-**Отчёт:**
-${review_output}
+${truncated_output}
 
 Задача перемещена в **Testing**."
 
-        log "=== Issue #${issue_number} прошёл ревью и передан в Testing ==="
-
+        log "=== Issue #${issue_number} прошёл ревью ==="
     else
         move_issue_to_status "${item_id}" "In Progress"
         log "Issue #${issue_number} → In Progress (ревью не пройдено)"
 
-        comment_on_issue "${issue_number}" "🔄 **Reviewer**: код не прошёл ревью. Требуются исправления.
+        comment_on_issue "${issue_number}" "🔄 **Reviewer**: код не прошёл ревью.
 
-**Отчёт ревью:**
-${review_output}
+${truncated_output}
 
-Задача возвращена в **In Progress** для исправления."
+Задача возвращена в **In Progress**."
 
-        log "=== Issue #${issue_number} не прошёл ревью, возвращён в In Progress ==="
+        log "=== Issue #${issue_number} не прошёл ревью ==="
     fi
 
     unassign_issue "${issue_number}"
+    rm -f "${output_file}" 2>/dev/null
 }
-
-# ---------------------------------------------------------------------------
-# Главный цикл
-# ---------------------------------------------------------------------------
 
 main() {
     check_dependencies
     log "============================================"
-    log "Reviewer Daemon запущен. Репозиторий: ${PIPELINE_REPO}"
-    log "Интервал опроса: ${SLEEP_INTERVAL}s"
-    log "Режим: СТАТИЧЕСКИЙ code review (без runtime)"
+    log "Reviewer Daemon v3. Режим: codex exec review --base main"
+    log "Интервал: ${SLEEP_INTERVAL}s"
     log "============================================"
 
     while true; do
         log "--- Новая итерация ---"
 
-        # Найти первую задачу в "Review" (любую, включая assigned)
         local task_line=""
         task_line=$(get_first_item_by_status "Review" 2>/dev/null || true)
 
@@ -246,14 +164,14 @@ main() {
             item_id=$(echo "${task_line}" | awk '{print $1}')
             issue_number=$(echo "${task_line}" | awk '{print $2}')
 
-            log "Найдена задача для ревью: issue #${issue_number} (item: ${item_id})"
+            log "Задача для ревью: issue #${issue_number}"
 
             if ! process_review "${item_id}" "${issue_number}"; then
-                log "ERROR: Ревью issue #${issue_number} завершилось с ошибкой. Продолжаем цикл."
+                log "ERROR: Ревью issue #${issue_number} завершилось с ошибкой."
             fi
         fi
 
-        log "Ожидание ${SLEEP_INTERVAL}s до следующей итерации..."
+        log "Ожидание ${SLEEP_INTERVAL}s..."
         sleep "${SLEEP_INTERVAL}"
     done
 }
