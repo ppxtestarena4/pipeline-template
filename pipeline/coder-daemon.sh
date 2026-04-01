@@ -134,6 +134,13 @@ calculate_sleep_until_window_reset() {
 # Основная логика итерации
 # ---------------------------------------------------------------------------
 
+# get_review_feedback <issue_number>
+# Извлекает последний комментарий Reviewer/Tester с причиной FAIL
+get_review_feedback() {
+    local issue_number="$1"
+    gh api "repos/${PIPELINE_REPO}/issues/${issue_number}/comments"         --jq 'last(.[] | select(.body | test("Reviewer|Tester")) | select(.body | contains("FAIL"))) | .body // ""' 2>/dev/null || echo ""
+}
+
 process_task() {
     local item_id="$1"
     local issue_number="$2"
@@ -193,6 +200,16 @@ ${issue_spec}
 - НЕ выполняй git-команды (git add, commit, push, checkout) — этим управляет скрипт-обёртка
 PROMPT
 )
+
+    # Если задача вернулась из Review — добавить feedback к промпту
+    local review_feedback
+    review_feedback=$(get_review_feedback "${issue_number}")
+    if [[ -n "${review_feedback}" ]] && [[ "${review_feedback}" != "null" ]]; then
+        log "Найден feedback от Reviewer. Добавляю к промпту."
+        local feedback_excerpt
+        feedback_excerpt=$(echo "${review_feedback}" | tail -c 2000)
+        coder_prompt+=$'\n\n## ВАЖНО: Предыдущее ревью выявило проблемы. ИСПРАВЬ ИХ:\n'"${feedback_excerpt}"$'\n\nИсправь КОНКРЕТНО указанные проблемы. Остальной код не трогай.'
+    fi
 
     log "Запускаем Claude Code для issue #${issue_number}..."
 
@@ -316,9 +333,12 @@ main() {
             fi
         fi
 
-        # Найти задачу в "To Do"
+        # Приоритет: In Progress (вернулись из Review) → To Do (новые)
         local task_line=""
-        task_line=$(get_first_unassigned_item_by_status "To Do" 2>/dev/null || true)
+        task_line=$(get_first_unassigned_item_by_status "In Progress" 2>/dev/null || true)
+        if [[ -z "${task_line}" ]]; then
+            task_line=$(get_first_unassigned_item_by_status "To Do" 2>/dev/null || true)
+        fi
 
         if [[ -z "${task_line}" ]]; then
             log "Нет задач в 'To Do'. Ожидание ${SLEEP_INTERVAL}s..."
