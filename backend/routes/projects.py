@@ -5,13 +5,6 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import (
-    Boolean,
-    Column,
-    DateTime,
-    ForeignKey,
-    String,
-    Table,
-    Text,
     and_,
     delete,
     insert,
@@ -19,49 +12,18 @@ from sqlalchemy import (
     select,
     update,
 )
-from sqlalchemy.dialects.postgresql import UUID as SQLAlchemyUUID
 from sqlalchemy.orm import Session
 
-from backend.database import Base, get_db
+from backend.database import get_db
 from backend.models import User
+from backend.models.project import Project, project_members
 from backend.schemas import ProjectCreate, ProjectMemberAdd, ProjectResponse, ProjectUpdate, UserBrief
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 security = HTTPBearer(auto_error=False)
 
-projects_table = Table(
-    "projects",
-    Base.metadata,
-    Column("id", SQLAlchemyUUID(as_uuid=True), primary_key=True, default=uuid.uuid4),
-    Column("name", String, nullable=False),
-    Column("description", Text, nullable=True),
-    Column(
-        "owner_id",
-        SQLAlchemyUUID(as_uuid=True),
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    ),
-    Column("is_archived", Boolean, nullable=False, default=False),
-    Column("created_at", DateTime, nullable=False, default=datetime.utcnow),
-)
-
-project_members_table = Table(
-    "project_members",
-    Base.metadata,
-    Column(
-        "project_id",
-        SQLAlchemyUUID(as_uuid=True),
-        ForeignKey("projects.id", ondelete="CASCADE"),
-        primary_key=True,
-    ),
-    Column(
-        "user_id",
-        SQLAlchemyUUID(as_uuid=True),
-        ForeignKey("users.id", ondelete="CASCADE"),
-        primary_key=True,
-    ),
-)
+projects_table = Project.__table__
+project_members_table = project_members
 
 
 def get_current_user(
